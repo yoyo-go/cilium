@@ -11,6 +11,7 @@ set -o pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 build_dir="${script_dir}/_build"
+conf_py="${script_dir}/conf.py"
 warnings="${build_dir}/warnings.txt"
 spelling="${build_dir}/spelling/output.txt"
 
@@ -21,7 +22,14 @@ cd "${script_dir}"
 mkdir -p "${build_dir}"
 
 build_with_spellchecker() {
-    sphinx-build -b spelling -d "${build_dir}/doctrees" . "${build_dir}/spelling" -q -E 2> "${warnings}"
+    exclude_patterns="$(sed -n "/exclude_patterns/ {s/[^']*'\([^']*\)'[^']*/\1,/g;p}" ${conf_py})"
+    # These readme files are generated from protocol buffer definitions. We
+    # want to ignore them as otherwise all sort of protocol message names etc
+    # appears as spelling mistakes, which breaks the doc build.
+    exclude_patterns="${exclude_patterns}_api/v1/*/README.md"
+    sphinx-build -b spelling -d "${build_dir}/doctrees" . "${build_dir}/spelling" -q -E \
+        -D "exclude_patterns=${exclude_patterns}" \
+        2> "${warnings}"
 }
 
 build_with_linkchecker() {
@@ -33,6 +41,7 @@ filter_warnings() {
         -e "tabs assets" \
         -e "misspelled words" \
         -e "RemovedInSphinx20Warning" \
+        -e "toctree contains reference to excluded document '_api/v1/.*/README'" \
         "${warnings}"
 }
 

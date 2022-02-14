@@ -80,6 +80,7 @@ get started and experiment with Cilium.
    contributing/testing/index
    bpf
    api
+   grpcapi
    internals/index
 
 .. toctree::

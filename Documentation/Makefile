@@ -88,7 +88,7 @@ $(HELM_VALUES): FORCE
 	$(QUIET)printf '..\n  %s\n\n%s\n' "AUTO-GENERATED. Please DO NOT edit manually." "$$(cat $@)" > $@
 	$(QUIET)$(RM) -- $(TMP_FILE_1) $(TMP_FILE_2)
 
-epub latex html: builder-image copy-api update-helm-values
+epub latex html: clean builder-image copy-api update-helm-values
 	@$(ECHO_GEN)_build/$@
 	$(QUIET)$(DOCKER_RUN) ./check-build.sh $(@) $(SPHINX_OPTS)
 

@@ -36,13 +36,16 @@ import cilium_spellfilters
 # extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
 # ones.
 html_logo = "images/logo.svg"
-extensions = ['sphinx.ext.ifconfig',
-              'sphinx.ext.githubpages',
-              'sphinx.ext.extlinks',
-              'sphinxcontrib.openapi',
-              'sphinx_tabs.tabs',
-              'sphinxcontrib.spelling',
-              'versionwarning.extension']
+extensions = [
+    'sphinx.ext.extlinks',
+    'sphinx.ext.githubpages',
+    'sphinx.ext.ifconfig',
+    'sphinx_markdown_tables',
+    'sphinx_tabs.tabs',
+    'sphinxcontrib.openapi',
+    'sphinxcontrib.spelling',
+    'versionwarning.extension',
+]
 
 # Add any paths that contain templates here, relative to this directory.
 templates_path = ['_templates']
