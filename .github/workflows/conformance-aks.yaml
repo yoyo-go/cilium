@@ -139,6 +139,16 @@ jobs:
           fi
 
           CILIUM_INSTALL_DEFAULTS="--cluster-name=${{ env.name }} \
+            --chart-directory=install/kubernetes/cilium \
+            --helm-opts=image.repository=quay.io/cilium/cilium-ci \
+            --helm-opts=image.tag=${SHA} \
+            --helm-opts=operator.image.repository=quay.io/cilium/operator \
+            --helm-opts=operator.image.suffix=-ci \
+            --helm-opts=operator.image.tag=${SHA} \
+            --helm-opts=clustermesh.apiserver.image.repository=quay.io/cilium/clustermesh-apiserver-ci \
+            --helm-opts=clustermesh.apiserver.image.tag=${SHA} \
+            --helm-opts=hubble.relay.image.repository=quay.io/cilium/hubble-relay-ci \
+            --helm-opts=hubble.relay.image.tag=${SHA} \
             --agent-image=quay.io/${{ github.repository_owner }}/cilium-ci \
             --operator-image=quay.io/${{ github.repository_owner }}/operator-azure-ci \
             --version=${SHA} \
@@ -246,6 +256,11 @@ jobs:
           for image in cilium-ci operator-azure-ci hubble-relay-ci ; do
             until curl --silent -f -lSL "https://quay.io/api/v1/repository/${{ github.repository_owner }}/$image/tag/${{ steps.vars.outputs.sha }}/images" &> /dev/null; do sleep 45s; done
           done
+
+      - name: Checkout code
+        uses: actions/checkout@ec3a7ce113134d7a93b817d10a8272cb61118579
+        with:
+          persist-credentials: false
 
       - name: Install Cilium
         run: |
