@@ -312,6 +312,15 @@ Annotations:
 1.12 Upgrade Notes
 ------------------
 
+* The kube-proxy replacement in the tunneling mode (i.e., ``vxlan`` or
+  ``geneve``) will set the ``reserved:world`` security identity for all service
+  requests coming from outside the cluster. Previously, when a selected service
+  endpoint was on a different node, the security identity was set to either
+  ``reserved:host`` or ``reserved:remote-node``. The change will impact those
+  clusters in which e.g. there is a network policy allowing access to the service
+  endpoints only from the inside cluster and previously, the service was access
+  from outside.
+
 New Options
 ~~~~~~~~~~~
 

@@ -295,6 +295,27 @@ Advanced Configuration
 This section covers a few advanced configuration modes for the kube-proxy replacement
 that go beyond the above Quick-Start guide and are entirely optional.
 
+Policy Enforcement
+******************
+
+When accessing a service from outside the cluster, the :ref:`arch_id_security`
+assignment depends on the routing and the kube-proxy replacement configuration.
+
+In the tunneling mode (i.e., ``--tunnel=vxlan`` or ``--tunnel=geneve``), the request
+to the service will have the ``reserved:world`` security identity. This allows a user to
+use a network policy with the ``fromEntities: cluster`` label selector.
+
+In the direct-routing mode (i.e., ``--tunnel=disabled``), the security identity
+will be set to ``reserved:world`` if the request was sent to the node which runs the
+selected endpoint by the LB. If not, i.e., the request needs to be forwarded to
+another node after the service endpoint selection, then it will have either ``reserved:host``
+or ``reserved:remote-node``. This makes the enforcement of the network policy
+inconsistent.
+
+To work around the inconsistency, one could apply any of the techniques mentioned
+in the section bellow to preserve the client source IP address in the forwarded
+request.
+
 Client Source IP Preservation
 *****************************
 
