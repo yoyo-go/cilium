@@ -588,12 +588,13 @@ func (ipc *IPCache) removeLabels(prefix string, lbls labels.Labels, src source.S
 //            | (2)    +------+--------+   (2) |
 //            +------->|Label Injector |<------+
 //           Trigger   +-------+-------+ Trigger
-//                         (4) |W
-//                             |
-//                             v
-//                           +---+
-//                           |IPC|
-//                           +---+
+//                    (4) |W    (5) |W
+//                        |         |
+//                        v         v
+//                   +--------+   +---+
+//                   |Policy &|   |IPC|
+//                   |datapath|   +---+
+//                   +--------+
 //      legend:
 //      * W means write
 //      * R means read
