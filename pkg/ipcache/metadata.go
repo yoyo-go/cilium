@@ -142,8 +142,12 @@ adds:
 // UpsertMetadata upserts a given IP and its corresponding labels associated
 // with it into the ipcache metadata map. The given labels are not modified nor
 // is its reference saved, as they're copied when inserting into the map.
+//
+// The caller must subsequently call ipc.TriggerLabelInjection() to implement
+// these metadata updates into the datapath.
 func (ipc *IPCache) UpsertMetadata(prefix string, lbls labels.Labels, src source.Source, uid k8sTypes.UID) {
 	ipc.metadata.upsert(prefix, lbls, src, uid)
+	ipc.metadata.enqueuePrefixUpdates([]string{prefix}, nil)
 }
 
 func (m *metadata) upsert(prefix string, lbls labels.Labels, src source.Source, uid k8sTypes.UID) {
@@ -186,116 +190,73 @@ func (m *metadata) get(prefix string) prefixInfo {
 // prefix was previously associated with an identity, it will get deallocated,
 // so a balance is kept, ensuring a one-to-one mapping between prefix and
 // identity.
-func (ipc *IPCache) InjectLabels() error {
+func (ipc *IPCache) InjectLabels(addedCIDRs []string) (remainingAdded []string, err error) {
 	if ipc.IdentityAllocator == nil || !ipc.IdentityAllocator.IsLocalIdentityAllocatorInitialized() {
-		return ErrLocalIdentityAllocatorUninitialized
+		return addedCIDRs, ErrLocalIdentityAllocatorUninitialized
 	}
 
 	if ipc.k8sSyncedChecker != nil &&
 		!ipc.k8sSyncedChecker.K8sCacheIsSynced() {
-		return errors.New("k8s cache not fully synced")
+		return addedCIDRs, errors.New("k8s cache not fully synced")
 	}
 
 	var (
-		// trigger is true when we need to trigger policy recalculations.
-		trigger bool
-		// toUpsert stores IPKeyPairs to upsert into the ipcache.
-		toUpsert = make(map[string]Identity)
-		// idsToPropagate stores the identities that must be updated via the
+		// idsToAdd stores the identities that must be updated via the
 		// selector cache.
-		idsToPropagate = make(map[identity.NumericIdentity]labels.LabelArray)
+		idsToAdd = make(map[identity.NumericIdentity]labels.LabelArray)
+		// toReplace stores the identity to replace in the ipcache.
+		toReplace = make(map[string]Identity)
 	)
 
 	ipc.metadata.applyChangesMU.Lock()
 	defer ipc.metadata.applyChangesMU.Unlock()
 
-	ipc.metadata.Lock()
-
-	for prefix, info := range ipc.metadata.m {
+	for i, prefix := range addedCIDRs {
+		info := ipc.metadata.get(prefix)
 		lbls := info.ToLabels()
-		id, isNew, err := ipc.injectLabels(prefix, lbls)
+
+		// TODO: Check if we need isNew (identity reference counting)
+		id, _, err := ipc.injectLabels(prefix, lbls)
 		if err != nil {
-			ipc.metadata.Unlock()
-			return fmt.Errorf("failed to allocate new identity for IP %v: %w", prefix, err)
+			return addedCIDRs[i:], fmt.Errorf("failed to allocate new identity for IP %v: %w", prefix, err)
 		}
 
-		hasKubeAPIServerLabel := lbls.Has(
-			labels.LabelKubeAPIServer[labels.IDNameKubeAPIServer],
-		)
-		// Identities with the kube-apiserver label should always be upserted
-		// if there was a change in their labels. This is especially important
-		// for IDs such as kube-apiserver or host (which can have the
-		// kube-apiserver label when the kube-apiserver is deployed within the
-		// cluster), or CIDR IDs for kube-apiservers deployed outside of the
-		// cluster.
-		// Also, any new identity should be upserted, regardless.
-		if hasKubeAPIServerLabel || isNew {
-			tmpSrc := info.Source()
-			if hasKubeAPIServerLabel {
-				// Overwrite the source because any IP associated with the
-				// kube-apiserver takes the strongest precedence. This is
-				// because we need to overwrite Local if only the local node IP
-				// has been upserted into the ipcache first.
-				//
-				// Also, trigger policy recalculations to update kube-apiserver
-				// identity.
-				newLbls := id.Labels
-				tmpSrc = source.KubeAPIServer
-				trigger = true
-				// If host identity has changed, update its labels.
-				if id.ID == identity.ReservedIdentityHost {
-					identity.AddReservedIdentityWithLabels(id.ID, newLbls)
-				}
-				idsToPropagate[id.ID] = newLbls.LabelArray()
-			}
-
-			toUpsert[prefix] = Identity{
-				ID:     id.ID,
-				Source: tmpSrc,
-			}
-		} else {
-			// Unlikely, but to balance the allocation / release
-			// we must either add the identity to `toUpsert`, or
-			// immediately release it again. Otherwise it will leak.
-			if _, err := ipc.IdentityAllocator.Release(context.TODO(), id, false); err != nil {
-				log.WithError(err).WithFields(logrus.Fields{
-					logfields.IPAddr: prefix,
-					logfields.Labels: lbls,
-				}).Error(
-					"Failed to release assigned identity during label injection, this might be a leak.",
-				)
-			} else {
-				log.WithFields(logrus.Fields{
-					logfields.IPAddr:   prefix,
-					logfields.Identity: id,
-				}).Debug(
-					"Released identity to balance reference counts",
-				)
-			}
+		// If host identity has changed, update its labels.
+		newLbls := id.Labels
+		if id.ID == identity.ReservedIdentityHost {
+			identity.AddReservedIdentityWithLabels(id.ID, newLbls)
+		}
+		idsToAdd[id.ID] = newLbls.LabelArray()
+		toReplace[prefix] = Identity{
+			ID:     id.ID,
+			Source: info.Source(),
 		}
 	}
-	// Don't hold lock while calling UpdateIdentities, as it will otherwise run into a deadlock
-	ipc.metadata.Unlock()
 
 	// Recalculate policy first before upserting into the ipcache.
-	if trigger {
-		ipc.UpdatePolicyMaps(context.TODO(), idsToPropagate, nil)
-	}
+	ipc.UpdatePolicyMaps(context.TODO(), idsToAdd, nil)
 
 	ipc.mutex.Lock()
 	defer ipc.mutex.Unlock()
-	for ip, id := range toUpsert {
+	for ip, id := range toReplace {
 		hIP, key := ipc.getHostIPCache(ip)
 		meta := ipc.getK8sMetadata(ip)
-		if _, err := ipc.upsertLocked(ip, hIP, key, meta, Identity{
-			ID:     id.ID,
-			Source: id.Source,
-		}, false /* !force */); err != nil {
-			return fmt.Errorf("failed to upsert %s into ipcache with identity %d: %w", ip, id.ID, err)
+		if _, err := ipc.upsertLocked(
+			ip,
+			hIP,
+			key,
+			meta,
+			id,
+			true,
+		); err != nil {
+			log.WithError(err).WithFields(logrus.Fields{
+				logfields.IPAddr:   ip,
+				logfields.Identity: id,
+			}).Error("Failed to replace ipcache entry with new identity after label removal. Traffic may be disrupted.")
 		}
 	}
 
-	return nil
+	return nil, nil
 }
 
 // UpdatePolicyMaps pushes updates for the specified identities into the policy
@@ -334,9 +295,29 @@ func (ipc *IPCache) injectLabels(prefix string, lbls labels.Labels) (*identity.I
 	ctx, cancel := context.WithTimeout(context.Background(), option.Config.IPAllocationTimeout)
 	defer cancel()
 
+	if lbls.Has(labels.LabelHost[labels.IDNameHost]) {
+		// Associate any new labels with the host identity.
+		//
+		// This case is a bit special, because other parts of Cilium
+		// have hardcoded assumptions around the host identity and
+		// that it corresponds to identity.ReservedIdentityHost.
+		// If additional labels are associated with the IPs of the
+		// host, add those extra labels into the host identity here
+		// so that policy will match on the identity correctly.
+		//
+		// We can get away with this because the host identity is only
+		// significant within the current agent's view (ie each agent
+		// will calculate its own host identity labels independently
+		// for itself). For all other identities, we avoid modifying
+		// the labels at runtime and instead opt to allocate new
+		// identities below.
+		identity.AddReservedIdentityWithLabels(identity.ReservedIdentityHost, lbls)
+		return identity.LookupReservedIdentity(identity.ReservedIdentityHost), false, nil
+	}
+
 	// If no other labels are associated with this IP, we assume that it's
 	// outside of the cluster and hence needs a CIDR identity.
-	if lbls.Equals(labels.LabelKubeAPIServer) {
+	if !(lbls.Has(labels.LabelRemoteNode[labels.IDNameRemoteNode])) {
 		// GH-17962: Handle the following case:
 		//   1) Apply ToCIDR policy (matching IPs of kube-apiserver)
 		//   2) Apply kube-apiserver policy
@@ -665,10 +646,13 @@ func (ipc *IPCache) TriggerLabelInjection() {
 		"ipcache-inject-labels",
 		controller.ControllerParams{
 			DoFunc: func(context.Context) error {
-				if err := ipc.InjectLabels(); err != nil {
-					return fmt.Errorf("failed to inject labels into ipcache: %w", err)
-				}
-				return nil
+				var (
+					err error
+				)
+				idsToAdd, idsToDelete := ipc.metadata.dequeuePrefixUpdates()
+				idsToAdd, err = ipc.InjectLabels(idsToAdd)
+				ipc.metadata.enqueuePrefixUpdates(idsToAdd, idsToDelete)
+				return err
 			},
 		},
 	)
