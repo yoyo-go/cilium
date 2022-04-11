@@ -20,7 +20,6 @@ import (
 	cidrlabels "github.com/cilium/cilium/pkg/labels/cidr"
 	"github.com/cilium/cilium/pkg/lock"
 	"github.com/cilium/cilium/pkg/logging/logfields"
-	"github.com/cilium/cilium/pkg/option"
 	"github.com/cilium/cilium/pkg/source"
 )
 
@@ -198,7 +197,7 @@ func (m *metadata) get(prefix string) prefixInfo {
 // Returns the added and updated CIDRs that were not yet processed, for example
 // due to an unexpected error while processing the identity updates for those
 // CIDRs. The caller should attempt to retry injecting labels for those CIDRs.
-func (ipc *IPCache) InjectLabels(addedCIDRs, updatedCIDRs []string) (remainingAdded, remainingUpdated []string, err error) {
+func (ipc *IPCache) InjectLabels(ctx context.Context, addedCIDRs, updatedCIDRs []string) (remainingAdded, remainingUpdated []string, err error) {
 	if ipc.IdentityAllocator == nil || !ipc.IdentityAllocator.IsLocalIdentityAllocatorInitialized() {
 		return addedCIDRs, updatedCIDRs, ErrLocalIdentityAllocatorUninitialized
 	}
@@ -283,7 +282,7 @@ func (ipc *IPCache) InjectLabels(addedCIDRs, updatedCIDRs []string) (remainingAd
 			lbls := prefixInfo.ToLabels()
 
 			// Insert to propagate the updated set of labels after removal.
-			newID, _, err = ipc.injectLabels(prefix, lbls)
+			newID, _, err = ipc.injectLabels(ctx, prefix, lbls)
 			if err != nil {
 				// NOTE: This may fail during a 2nd or later
 				// iteration, in which case an identity may
@@ -334,7 +333,7 @@ func (ipc *IPCache) InjectLabels(addedCIDRs, updatedCIDRs []string) (remainingAd
 	for i, prefix := range addedCIDRs {
 		info := ipc.metadata.get(prefix)
 		lbls := info.ToLabels()
-		id, _, err := ipc.injectLabels(prefix, lbls)
+		id, _, err := ipc.injectLabels(ctx, prefix, lbls)
 		if err != nil {
 			log.WithError(err).WithFields(logrus.Fields{
 				logfields.IPAddr:   prefix,
@@ -361,7 +360,7 @@ func (ipc *IPCache) InjectLabels(addedCIDRs, updatedCIDRs []string) (remainingAd
 	}
 
 	// Recalculate policy first before upserting into the ipcache.
-	ipc.UpdatePolicyMaps(context.TODO(), idsToAdd, idsToDelete)
+	ipc.UpdatePolicyMaps(ctx, idsToAdd, idsToDelete)
 
 	ipc.mutex.Lock()
 	defer ipc.mutex.Unlock()
@@ -386,11 +385,11 @@ func (ipc *IPCache) InjectLabels(addedCIDRs, updatedCIDRs []string) (remainingAd
 		ipc.deleteLocked(ip, id.Source)
 	}
 	for id := range previouslyAllocatedIdentities {
-		realID := ipc.IdentityAllocator.LookupIdentityByID(context.TODO(), id)
+		realID := ipc.IdentityAllocator.LookupIdentityByID(ctx, id)
 		if realID == nil {
 			continue
 		}
-		_, err := ipc.IdentityAllocator.Release(context.TODO(), realID, false)
+		_, err := ipc.IdentityAllocator.Release(ctx, realID, false)
 		if err != nil {
 			log.WithError(err).WithFields(logrus.Fields{
 				logfields.Identity:       realID,
@@ -436,10 +435,7 @@ func (ipc *IPCache) UpdatePolicyMaps(ctx context.Context, addedIdentities, delet
 // policy is applied will need to be converted (released and re-allocated) to
 // account for the new kube-apiserver label that will be attached to them. This
 // is a known issue, see GH-17962 below.
-func (ipc *IPCache) injectLabels(prefix string, lbls labels.Labels) (*identity.Identity, bool, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), option.Config.IPAllocationTimeout)
-	defer cancel()
-
+func (ipc *IPCache) injectLabels(ctx context.Context, prefix string, lbls labels.Labels) (*identity.Identity, bool, error) {
 	if lbls.Has(labels.LabelHost[labels.IDNameHost]) {
 		// Associate any new labels with the host identity.
 		//
@@ -474,7 +470,7 @@ func (ipc *IPCache) injectLabels(prefix string, lbls labels.Labels) (*identity.I
 		//   need to remove old entries from ipcache because the caller will
 		//   overwrite the ipcache entry anyway.
 
-		return ipc.injectLabelsForCIDR(prefix, lbls)
+		return ipc.injectLabelsForCIDR(ctx, prefix, lbls)
 	}
 
 	return ipc.IdentityAllocator.AllocateIdentity(ctx, lbls, false, identity.InvalidIdentity)
@@ -482,7 +478,7 @@ func (ipc *IPCache) injectLabels(prefix string, lbls labels.Labels) (*identity.I
 
 // injectLabelsForCIDR will allocate a CIDR identity for the given prefix. The
 // release of the identity must be managed by the caller.
-func (ipc *IPCache) injectLabelsForCIDR(p string, lbls labels.Labels) (*identity.Identity, bool, error) {
+func (ipc *IPCache) injectLabelsForCIDR(ctx context.Context, p string, lbls labels.Labels) (*identity.Identity, bool, error) {
 	var prefix string
 
 	ip := net.ParseIP(p)
@@ -509,7 +505,7 @@ func (ipc *IPCache) injectLabelsForCIDR(p string, lbls labels.Labels) (*identity
 		"Injecting CIDR labels for prefix",
 	)
 
-	return ipc.allocate(cidr, allLbls, identity.InvalidIdentity)
+	return ipc.allocate(ctx, cidr, allLbls, identity.InvalidIdentity)
 }
 
 // RemoveLabelsExcluded removes the given labels from all IPs inside the IDMD
@@ -611,12 +607,12 @@ func (ipc *IPCache) TriggerLabelInjection() {
 	ipc.UpdateController(
 		"ipcache-inject-labels",
 		controller.ControllerParams{
-			DoFunc: func(context.Context) error {
+			DoFunc: func(ctx context.Context) error {
 				var (
 					err error
 				)
 				idsToAdd, idsToDelete := ipc.metadata.dequeuePrefixUpdates()
-				idsToAdd, idsToDelete, err = ipc.InjectLabels(idsToAdd, idsToDelete)
+				idsToAdd, idsToDelete, err = ipc.InjectLabels(ctx, idsToAdd, idsToDelete)
 				ipc.metadata.enqueuePrefixUpdates(idsToAdd, idsToDelete)
 				return err
 			},
