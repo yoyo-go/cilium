@@ -190,35 +190,162 @@ func (m *metadata) get(prefix string) prefixInfo {
 // prefix was previously associated with an identity, it will get deallocated,
 // so a balance is kept, ensuring a one-to-one mapping between prefix and
 // identity.
-func (ipc *IPCache) InjectLabels(addedCIDRs []string) (remainingAdded []string, err error) {
+//
+// Do not place the same CIDR into both 'addedCIDRs' and 'updatedCIDRs'!
+// If there is a duplicate between the two, ensure to only put the prefix into
+// 'updatedCIDRs'.
+//
+// Returns the added and updated CIDRs that were not yet processed, for example
+// due to an unexpected error while processing the identity updates for those
+// CIDRs. The caller should attempt to retry injecting labels for those CIDRs.
+func (ipc *IPCache) InjectLabels(addedCIDRs, updatedCIDRs []string) (remainingAdded, remainingUpdated []string, err error) {
 	if ipc.IdentityAllocator == nil || !ipc.IdentityAllocator.IsLocalIdentityAllocatorInitialized() {
-		return addedCIDRs, ErrLocalIdentityAllocatorUninitialized
+		return addedCIDRs, updatedCIDRs, ErrLocalIdentityAllocatorUninitialized
 	}
 
 	if ipc.k8sSyncedChecker != nil &&
 		!ipc.k8sSyncedChecker.K8sCacheIsSynced() {
-		return addedCIDRs, errors.New("k8s cache not fully synced")
+		return addedCIDRs, updatedCIDRs, errors.New("k8s cache not fully synced")
 	}
 
 	var (
 		// idsToAdd stores the identities that must be updated via the
 		// selector cache.
-		idsToAdd = make(map[identity.NumericIdentity]labels.LabelArray)
-		// toReplace stores the identity to replace in the ipcache.
-		toReplace = make(map[string]Identity)
+		idsToAdd                      = make(map[identity.NumericIdentity]labels.LabelArray)
+		idsToDelete                   = make(map[identity.NumericIdentity]labels.LabelArray)
+		previouslyAllocatedIdentities = make(map[identity.NumericIdentity]struct{})
+		// entriesToReplace stores the identity to replace in the ipcache.
+		entriesToReplace   = make(map[string]Identity)
+		entriesToDelete    = make(map[string]Identity)
+		forceIPCacheUpdate = make(map[string]bool) // prefix => force
 	)
 
 	ipc.metadata.applyChangesMU.Lock()
 	defer ipc.metadata.applyChangesMU.Unlock()
 
+	// Example
+	// Preconditions: Before, these events happened:
+	// 1) Add kube-apiserver label to IP prefix X
+	// 2) Add remote-node label to IP prefix X
+	//
+	// X -> prefixInfo {
+	//    UID A -> kube-apiserver label for X (from k8s endpoint resource)
+	//    UID B -> remote-node label for X (from node / ciliumnode)
+	//}
+	//
+	// Reason through the delete event:
+	// 3) Delete kube-apiserver label
+	// InjectLabels({X}, {})
+
+	// for deleted {
+	// - What is the new identity for each CIDR
+	// outputs:
+	//  - New identities / things to update (to handle removing 1 UID in a prefixInfo with 2) - remove kube-apiserver label from IP with 'remote-node' label
+	//  - Deleted identities - prefixes that no longer have any label associations
+	//}
+	//
+	// for added {
+	// - What is the new identity
+	// outputs:
+	//  - New identities for prefixes that got new labels
+	// }
+	//
+	//  -> Trigger policy, bpf policy updates
+
+	for i, prefix := range updatedCIDRs {
+		id, exists := ipc.LookupByIP(prefix)
+		if !exists {
+			log.WithError(err).WithFields(logrus.Fields{
+				logfields.IPAddr: prefix,
+			}).Warning(
+				"Unexpected request to handle IPCache deletion for a prefix that is not present",
+			)
+			continue
+		}
+		// 'prefix' is being removed or modified, so some previous
+		// iteration of this code hit one of the 'injectLabels' cases
+		// below, thereby allocating an identity. If we delete or
+		// update the identity for 'prefix' in this iteration of the
+		// loop, then we must balance the allocation from the prior
+		// iteration by releasing the previous reference again.
+		previouslyAllocatedIdentities[id.ID] = struct{}{}
+
+		prefixInfo := ipc.metadata.get(prefix)
+		if prefixInfo == nil {
+			// The recent update to the metadata cache informs us
+			// that there should no longer be any association from
+			// this IP to a set of labels.
+			idsToDelete[id.ID] = nil     // SelectorCache removal
+			entriesToDelete[prefix] = id // IPCache removal
+		} else {
+			var newID *identity.Identity
+
+			lbls := prefixInfo.ToLabels()
+
+			// Insert to propagate the updated set of labels after removal.
+			newID, _, err = ipc.injectLabels(prefix, lbls)
+			if err != nil {
+				// NOTE: This may fail during a 2nd or later
+				// iteration, in which case an identity may
+				// have been previously allocated during this
+				// loop.
+				//
+				// To handle this, we continue with executing
+				// the set of changes that we already queued
+				// up from the iteration through the loop.
+				//
+				// We'll also end up releasing some old
+				// identities as part of this, so hopefully
+				// this forward progress will unblock
+				// subsequent calls into this function.
+				log.WithError(err).WithFields(logrus.Fields{
+					logfields.IPAddr:   prefix,
+					logfields.Identity: id,
+					logfields.Labels:   lbls, // new labels
+				}).Warning(
+					"Failed to allocate new identity after dissociating labels from existing prefix.",
+				)
+				// If allocation fails during handling of
+				// of updatedCIDRs, then it'll probably fail
+				// during adds, so skip that loop below.
+				remainingAdded = addedCIDRs
+				addedCIDRs = nil
+				remainingUpdated = updatedCIDRs[i:]
+				err = fmt.Errorf("failed to allocate new identity during prefix update: %w", err)
+				break
+			}
+			idsToAdd[newID.ID] = lbls.LabelArray()
+			entriesToReplace[prefix] = Identity{
+				ID:     newID.ID,
+				Source: prefixInfo.Source(),
+			}
+			// IPCache.Upsert() and friends currently require a
+			// Source to be provided during upsert. If the old
+			// Source was higher precedence due to labels that
+			// have now been removed, then we need to explicitly
+			// work around that to remove the old higher-priority
+			// identity and replace it with this new identity.
+			if prefixInfo.Source() != id.Source {
+				forceIPCacheUpdate[prefix] = true
+			}
+		}
+	}
+
 	for i, prefix := range addedCIDRs {
 		info := ipc.metadata.get(prefix)
 		lbls := info.ToLabels()
-
-		// TODO: Check if we need isNew (identity reference counting)
 		id, _, err := ipc.injectLabels(prefix, lbls)
 		if err != nil {
-			return addedCIDRs[i:], fmt.Errorf("failed to allocate new identity for IP %v: %w", prefix, err)
+			log.WithError(err).WithFields(logrus.Fields{
+				logfields.IPAddr:   prefix,
+				logfields.Identity: id,
+				logfields.Labels:   lbls,
+			}).Warning(
+				"Failed to allocate new identity after associating labels with new prefix.",
+			)
+			remainingAdded = addedCIDRs[i:]
+			err = fmt.Errorf("failed to allocate new identity during prefix add: %w", err)
+			break
 		}
 
 		// If host identity has changed, update its labels.
@@ -227,36 +354,54 @@ func (ipc *IPCache) InjectLabels(addedCIDRs []string) (remainingAdded []string, 
 			identity.AddReservedIdentityWithLabels(id.ID, newLbls)
 		}
 		idsToAdd[id.ID] = newLbls.LabelArray()
-		toReplace[prefix] = Identity{
+		entriesToReplace[prefix] = Identity{
 			ID:     id.ID,
 			Source: info.Source(),
 		}
 	}
 
 	// Recalculate policy first before upserting into the ipcache.
-	ipc.UpdatePolicyMaps(context.TODO(), idsToAdd, nil)
+	ipc.UpdatePolicyMaps(context.TODO(), idsToAdd, idsToDelete)
 
 	ipc.mutex.Lock()
 	defer ipc.mutex.Unlock()
-	for ip, id := range toReplace {
+	for ip, id := range entriesToReplace {
 		hIP, key := ipc.getHostIPCache(ip)
 		meta := ipc.getK8sMetadata(ip)
-		if _, err := ipc.upsertLocked(
+		if _, err2 := ipc.upsertLocked(
 			ip,
 			hIP,
 			key,
 			meta,
 			id,
-			true,
-		); err != nil {
+			forceIPCacheUpdate[ip],
+		); err2 != nil {
 			log.WithError(err).WithFields(logrus.Fields{
 				logfields.IPAddr:   ip,
 				logfields.Identity: id,
 			}).Error("Failed to replace ipcache entry with new identity after label removal. Traffic may be disrupted.")
 		}
 	}
+	for ip, id := range entriesToDelete {
+		ipc.deleteLocked(ip, id.Source)
+	}
+	for id := range previouslyAllocatedIdentities {
+		realID := ipc.IdentityAllocator.LookupIdentityByID(context.TODO(), id)
+		if realID == nil {
+			continue
+		}
+		_, err := ipc.IdentityAllocator.Release(context.TODO(), realID, false)
+		if err != nil {
+			log.WithError(err).WithFields(logrus.Fields{
+				logfields.Identity:       realID,
+				logfields.IdentityLabels: realID.Labels,
+			}).Warning(
+				"Failed to release previously allocated identity during ipcache metadata injection.",
+			)
+		}
+	}
 
-	return nil, nil
+	return remainingAdded, remainingUpdated, err
 }
 
 // UpdatePolicyMaps pushes updates for the specified identities into the policy
@@ -368,9 +513,10 @@ func (ipc *IPCache) injectLabelsForCIDR(p string, lbls labels.Labels) (*identity
 }
 
 // RemoveLabelsExcluded removes the given labels from all IPs inside the IDMD
-// except for the IPs / prefixes inside the given excluded set. This may cause
-// updates to the ipcache, as well as to the identity and policy logic via
-// 'updater' and 'triggerer'.
+// except for the IPs / prefixes inside the given excluded set.
+//
+// The caller must subsequently call IPCache.TriggerLabelInjection() to push
+// these changes down into the policy engine and ipcache datapath maps.
 func (ipc *IPCache) RemoveLabelsExcluded(
 	lbls labels.Labels,
 	toExclude map[string]struct{},
@@ -384,14 +530,11 @@ func (ipc *IPCache) RemoveLabelsExcluded(
 	defer ipc.metadata.Unlock()
 
 	oldSet := ipc.metadata.filterByLabels(lbls)
-	toRemove := make(map[string]labels.Labels)
 	for _, ip := range oldSet {
 		if _, ok := toExclude[ip]; !ok {
-			toRemove[ip] = lbls
+			ipc.removeLabels(ip, lbls, src, uid)
 		}
 	}
-
-	ipc.removeLabelsFromIPs(toRemove, src, uid)
 }
 
 // filterByLabels returns all the prefixes inside the ipcache metadata map
@@ -411,198 +554,21 @@ func (m *metadata) filterByLabels(filter labels.Labels) []string {
 	return matching
 }
 
-// removeLabelsFromIPs removes all given prefixes at once. This function will
-// trigger policy update and recalculation if necessary on behalf of the
-// caller.
+// removeLabels removes the given labels association with the given prefix.
 //
-// A prefix will only be removed from the IDMD if the set of labels becomes
-// empty.
-//
-// Assumes that the ipcache metadata lock is taken!
-func (ipc *IPCache) removeLabelsFromIPs(
-	m map[string]labels.Labels,
-	src source.Source,
-	uid k8sTypes.UID,
-) {
-	var (
-		idsToAdd    = make(map[identity.NumericIdentity]labels.LabelArray)
-		idsToDelete = make(map[identity.NumericIdentity]labels.LabelArray)
-		// toReplace stores the identity to replace in the ipcache.
-		toReplace = make(map[string]Identity)
-	)
-
-	ipc.Lock()
-	defer ipc.Unlock()
-
-	for prefix, lbls := range m {
-		id, exists := ipc.LookupByIPRLocked(prefix)
-		if !exists {
-			continue
-		}
-
-		idsToDelete[id.ID] = nil // labels for deletion don't matter to UpdateIdentities()
-
-		// Insert to propagate the updated set of labels after removal.
-		l := ipc.removeLabels(prefix, lbls, src, uid)
-		if len(l) > 0 {
-			// If for example kube-apiserver label is removed from the local
-			// host identity (when the kube-apiserver is running within the
-			// cluster and it is no longer running on the current local host),
-			// then removeLabels() will return a non-empty set representing the
-			// new full set of labels to associate with the node (in this
-			// example, just the local host label). In order to propagate the
-			// new identity, we must emit a delete event for the old identity
-			// and then an add event for the new identity.
-
-			// If host identity has changed, update its labels.
-			if id.ID == identity.ReservedIdentityHost {
-				identity.AddReservedIdentityWithLabels(id.ID, l)
-			}
-
-			newID, _, err := ipc.IdentityAllocator.AllocateIdentity(context.TODO(), l, false, identity.InvalidIdentity)
-			if err != nil {
-				log.WithError(err).WithFields(logrus.Fields{
-					logfields.IPAddr:         prefix,
-					logfields.Identity:       id,
-					logfields.IdentityLabels: l,    // new labels
-					logfields.Labels:         lbls, // removed labels
-				}).Error(
-					"Failed to allocate new identity after dissociating labels from existing identity. Traffic may be disrupted.",
-				)
-				continue
-			}
-			idsToAdd[newID.ID] = l.LabelArray()
-			toReplace[prefix] = Identity{
-				ID:     newID.ID,
-				Source: sourceByLabels(src, l),
-			}
-		}
-	}
-	if len(idsToDelete) > 0 {
-		ipc.UpdatePolicyMaps(context.TODO(), idsToAdd, idsToDelete)
-	}
-	for ip, id := range toReplace {
-		hIP, key := ipc.getHostIPCache(ip)
-		meta := ipc.getK8sMetadata(ip)
-		if _, err := ipc.upsertLocked(
-			ip,
-			hIP,
-			key,
-			meta,
-			id,
-			true, /* force upsert */
-		); err != nil {
-			log.WithError(err).WithFields(logrus.Fields{
-				logfields.IPAddr:   ip,
-				logfields.Identity: id,
-			}).Error("Failed to replace ipcache entry with new identity after label removal. Traffic may be disrupted.")
-		}
-	}
-}
-
-// removeLabels removes the given labels association with the given prefix. The
-// leftover labels are returned, if any. If there are leftover labels, the
-// caller must allocate a new identity and do the following *in order* to avoid
-// drops:
-//   1) policy recalculation must be implemented into the datapath and
-//   2) new identity must have a new entry upserted into the IPCache
-// Note: GH-17962, triggering policy recalculation doesn't actually *implement*
-// the changes into datapath (because it's an async call), this is a known
-// issue. There's a very small window for drops when two policies select the
-// same traffic and the identity changes. For example, this is possible if an
-// IP is associated with the kube-apiserver and referenced inside a ToCIDR
-// policy, and then the IP is no longer associated with the kube-apiserver.
-//
-// Identities are deallocated and their subequent entry in the IPCache is
-// removed if the prefix is no longer associated with any labels.
-//
-// This function assumes that the ipcache metadata and the IPIdentityCache
-// locks are taken!
-func (ipc *IPCache) removeLabels(prefix string, lbls labels.Labels, src source.Source, uid k8sTypes.UID) labels.Labels {
+// This function assumes that the ipcache metadata lock is held for writing.
+func (ipc *IPCache) removeLabels(prefix string, lbls labels.Labels, src source.Source, uid k8sTypes.UID) {
 	info, ok := ipc.metadata.m[prefix]
 	if !ok {
-		return nil
+		return
 	}
 	delete(info, uid)
 
 	l := info.ToLabels()
 	if len(l) == 0 { // Labels empty, delete
-		// No labels left. Example case: when the kube-apiserver is running
-		// outside of the cluster, meaning that the IDMD only ever had the
-		// kube-apiserver label (CIDR labels are not added) and it's now being
-		// removed.
 		delete(ipc.metadata.m, prefix)
-	} else {
-		// TODO: Ensure that CiliumNode updates will populate the 'info'
-		// with the information "CIDR X is a remote node".
 	}
-
-	// TODO: Delete...?
-	id, exists := ipc.LookupByIPRLocked(prefix)
-	if !exists {
-		log.WithFields(logrus.Fields{
-			logfields.CIDR:   prefix,
-			logfields.Labels: lbls,
-		}).Warn(
-			"Identity for prefix was unexpectedly not found in ipcache, unable " +
-				"to remove labels from prefix. If a network policy is applied, check " +
-				"for any drops. It's possible that insertion or removal from " +
-				"the ipcache failed.",
-		)
-		return nil
-	}
-
-	realID := ipc.IdentityAllocator.LookupIdentityByID(context.TODO(), id.ID)
-	if realID == nil {
-		log.WithFields(logrus.Fields{
-			logfields.CIDR:     prefix,
-			logfields.Labels:   lbls,
-			logfields.Identity: id,
-		}).Warn(
-			"Identity unexpectedly not found within the identity allocator, " +
-				"unable to remove labels from prefix. It's possible that insertion " +
-				"or removal from the ipcache failed.",
-		)
-		return nil
-	}
-	released, err := ipc.IdentityAllocator.Release(context.TODO(), realID, false)
-	if err != nil {
-		log.WithError(err).WithFields(logrus.Fields{
-			logfields.IPAddr:         prefix,
-			logfields.Labels:         lbls,
-			logfields.Identity:       realID,
-			logfields.IdentityLabels: realID.Labels,
-		}).Error(
-			"Failed to release assigned identity to IP while removing label association, this might be a leak.",
-		)
-		return nil
-	}
-	if released {
-		ipc.deleteLocked(prefix, sourceByLabels(src, lbls))
-		return nil
-	}
-
-	// TODO: Is it possible for a CIDR identity to hit this line? Maybe if
-	// there is CIDR policy for a kube-apiserver /32 IP, and you add/delete
-	// that policy a few times, you leak references to the identity
-	// corresponding to "reserved:kube-apiserver","cidr:w.x.y.z/32", ..
-
-	// Generate new identity with the label removed. This should be the case
-	// where the existing identity had >1 refcount, meaning that something was
-	// referring to it.
-	//
-	// If kube-apiserver is inside the cluster, this path is always hit
-	// (because even if we remove the kube-apiserver from that node, we
-	// need to inject the identity corresponding to "host" or "remote-node"
-	// (without apiserver label)
-	return l
-}
-
-func sourceByLabels(d source.Source, lbls labels.Labels) source.Source {
-	if lbls.Has(labels.LabelKubeAPIServer[labels.IDNameKubeAPIServer]) {
-		return source.KubeAPIServer
-	}
-	return d
+	ipc.metadata.enqueuePrefixUpdates(nil, []string{prefix})
 }
 
 // TriggerLabelInjection triggers the label injection controller to iterate
@@ -650,7 +616,7 @@ func (ipc *IPCache) TriggerLabelInjection() {
 					err error
 				)
 				idsToAdd, idsToDelete := ipc.metadata.dequeuePrefixUpdates()
-				idsToAdd, err = ipc.InjectLabels(idsToAdd)
+				idsToAdd, idsToDelete, err = ipc.InjectLabels(idsToAdd, idsToDelete)
 				ipc.metadata.enqueuePrefixUpdates(idsToAdd, idsToDelete)
 				return err
 			},
